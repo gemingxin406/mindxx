@@ -1,5 +1,7 @@
-from transformers import PretrainedConfig
+import math
+from typing import Optional
 
+from transformers import PretrainedConfig
 
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
@@ -84,6 +86,60 @@ class RMSNorm(nn.Module):
     def _norm_(self, x):
         return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 #forward()方法
-
     def forward(self, x):
-        return x * self.weight* self._norm_(x.flout()).type_as(x)*x
+        return x * self.weight* self._norm_(x.float()).type_as(x)*x
+
+def freqs_cis(
+        dim:int,              #维度
+        end:int=int(32*1024), #推入的序列长度（默认32*1024）
+        rope_base:float=1e6,  #公式中的变量
+        rope_scaling: Optional[dict] = None,  #缩放公式
+):
+   #ROPE公式
+   freqs = 1.0/rope_base**(torch.arange(0, dim, 2)[:dim//2].float()/dim)
+   if rope_scaling is not None:
+      orig_max,factor,beta_fast,beta_slow=(
+          rope_scaling.get("original_max_position_embeddings",2048),
+          rope_scaling.get("factor",4),
+          rope_scaling.get("beta_fast",4),
+          rope_scaling.get("beta_slow",1),
+      )
+#计算corr_dim
+      corr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max), dim//2)
+#计算power
+      power = torch.arange(0, dim//2, device=freqs.device).float()/(max(dim//2-1, 1))
+#计算权重beta
+      beta = beta_slow+(beta_fast-beta_slow)* power
+#计算scale
+      scale = torch.where(
+          torch.arange(dim//2, device=freqs.device)<corr_dim,
+          (beta*factor-beta+1)/(beta*factor),
+          1.0/factor
+      )
+#应用scale
+      freqs = freqs*scale
+   #生成位置索引，与频率相乘
+   t = torch.arange(end, device=freqs.device).float()
+   freqs=torch.outer(t, freqs).float()
+#返回一个cos和sin
+   freqs_cos=torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+   freqs_sin=torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+   return freqs_cos,freqs_sin
+#应用旋转位置编码
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+     #[a,b]->[-b,a]
+    def rotate_half(x):
+        #x.shape=[-1]取最后一个维度的重点
+        #x[..., : x.shape[-1] // 2:]取后半部分
+        #x[..., x.shape[-1] // 2:]取前半部分
+        return torch.cat([-x[..., : x.shape[-1] // 2:], x[..., x.shape[-1] // 2 ]],
+                         dim=-1)
+    #旋转公式
+    # 旋转位置编码公式：
+     #q_embed = q * cosθ + rotate_half(q) * sinθ
+     #k_embed = k * cosθ + rotate_half(k) * sinθ
+    #x_rot=x*cos+rotate_half(x)*sin
+    #unsqueeze用于后续维度的拓展
+    q_embed=(q*cos.unsqueeze(unsqueeze_dim)+rotate_half(q)*sin.unsqueeze(unsqueeze_dim))
+    k_embed=(k*cos.unsqueeze(unsqueeze_dim)+rotate_half(k)*sin.unsqueeze(unsqueeze_dim))
+    return  q_embed, k_embed
