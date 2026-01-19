@@ -1,9 +1,6 @@
 import math
 from typing import Optional,Tuple,Union
 
-from mpmath import extend
-from sympy.codegen.cnodes import union
-from torch.linalg import diagonal
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -92,7 +89,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 #_norm_()方法
     def _norm_(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 #forward()方法
     def forward(self, x):
         return x * self.weight* self._norm_(x.float()).type_as(x)*x
@@ -104,7 +101,7 @@ def freqs_cis(
         rope_scaling: Optional[dict] = None,  #缩放公式
 ):
    #ROPE公式
-   freqs = 1.0/rope_theta**(torch.arange(0, dim, 2)[:dim//2].float()/dim)  # 使用rope_theta
+   freqs = 1.0/(rope_theta**(torch.arange(0, dim, 2)[:dim//2].float()/dim))  # 使用rope_theta
    if rope_scaling is not None:
       orig_max,factor,beta_fast,beta_slow=(
           rope_scaling.get("original_max_position_embeddings",2048),
@@ -113,19 +110,20 @@ def freqs_cis(
           rope_scaling.get("beta_slow",1),
       )
 #计算corr_dim
-      corr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max), dim//2)
-#计算power
-      power = torch.arange(0, dim//2, device=freqs.device).float()/(max(dim//2-1, 1))
-#计算权重beta
-      beta = beta_slow+(beta_fast-beta_slow)* power
-#计算scale
-      scale = torch.where(
-          torch.arange(dim//2, device=freqs.device)<corr_dim,
-          (beta*factor-beta+1)/(beta*factor),
-          1.0/factor
-      )
-#应用scale
-      freqs = freqs*scale
+      if end/orig_max>1.0:
+          corr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max), dim//2)
+    #计算power
+          power = torch.arange(0, dim//2, device=freqs.device).float()/(max(dim//2-1, 1))
+    #计算权重beta
+          beta = beta_slow+(beta_fast-beta_slow)* power
+    #计算scale
+          scale = torch.where(
+              torch.arange(dim//2, device=freqs.device)<corr_dim,
+              (beta*factor-beta+1)/(beta*factor),
+              1.0/factor
+          )
+    #应用scale
+          freqs = freqs*scale
    #生成位置索引，与频率相乘
    t = torch.arange(end, device=freqs.device).float()
    freqs=torch.outer(t, freqs).float()
@@ -168,14 +166,15 @@ def repeat_kv(x: torch.Tensor, n_rep: int):
 class Attention(nn.Module):
     def __init__(self, args:MokioMindConfig):
         super().__init__()
-        self.num_key_value_heads = args.num_key_value_heads
-        if args.num_key_value_heads is None:
-            self.num_key_value_heads = args.num_attention_heads
-            assert (
-                args.num_attention_heads % args.num_key_value_heads == 0
-            ), "num_attention_heads should be divisible by num_key_value_heads"
+        self.num_key_value_heads =(
+            args.num_key_value_heads
+            if args.num_key_value_heads is None
+            else args.num_attention_heads
+        )
+        assert args.num_attention_heads % args.num_key_value_heads == 0,(
+            "num_key_value_heads must be a multiple of num_attention_heads"
+        )
         self.n_local_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
         self.n_rep=self.n_local_heads//self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
         #对线性层的Q,K,V进行定义
@@ -192,7 +191,7 @@ class Attention(nn.Module):
         self.flash=hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
     def forward(self,
                 x:torch.Tensor,
-                position_embedding:Tuple[torch.Tensor,torch.Tensor],
+                position_embeddings:Tuple[torch.Tensor,torch.Tensor],
                 past_key_value:Optional[Tuple[torch.Tensor,torch.Tensor]]=None,
                 use_cache=False,
                 attention_mask:Optional[torch.Tensor]=None,
@@ -205,7 +204,7 @@ class Attention(nn.Module):
      xk=xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
      xv=xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
     #q和k使用rope
-     cos,sin=position_embedding
+     cos,sin=position_embeddings
      xq,xk=apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
     #对于k和v，使用repeat(注意kv cache)
      if past_key_value is not None:
@@ -262,13 +261,15 @@ class FeedForward(nn.Module):
         self.dropout=nn.Dropout(args.dropout)
         self.act_fn=ACT2FN[args.hidden_act]
     def forward(self,x):
+        gated= self.act_fn(self.gate_proj(x))*self.up_proj(x)
         return self.dropout(
-            self.down_proj(self.act_fn(self.gate_proj(x))*self.up_proj(x))
+            self.down_proj(gated)
         )
     #block拼接
 class MokiomindBlock(nn.Module):
     def __init__(self,layer_id:int,args:MokioMindConfig):
         super().__init__()
+        self.config=args
         self.num_attention_heads=args.num_attention_heads
         self.hidden_size=args.hidden_size
         self.hidden_dim= self.hidden_size//self.num_attention_heads
@@ -340,7 +341,8 @@ class MokioMind(nn.Module):
                 self.freqs_sin[start_pos:start_pos+seq_len],
             )
             presents=[]
-            for layer_idx,(layer,past_key_value)in enumerate(zip(self.layers,past_key_values)):
+            for layer_idx,(layer,past_key_value)in enumerate(
+                    zip(self.layers,past_key_values)):
                 hidden_states,present=layer(
                     hidden_states,
                     position_embeddings,
@@ -365,8 +367,6 @@ class MokioMindForCausalLM(PreTrainedModel,GenerationMixin):
         )
         #权重共享，输出层权重与嵌入层权重共享
         self.model.embed_tokens.weight=self.lm_head.weight
-
-        self.OUT=CausalLMOutputWithPast()
 
     def forward(
         self,
@@ -393,7 +393,8 @@ class MokioMindForCausalLM(PreTrainedModel,GenerationMixin):
         )
         logits=self.lm_head(hidden_states[...,slice_indices,:])
 
-        self.OUT.__setitem__("last_hidden_state",hidden_states)
-        self.OUT.__setitem__("logits",logits)
-        self.OUT.__setitem__("past_key_values",past_key_values)
-        return self.OUT
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
