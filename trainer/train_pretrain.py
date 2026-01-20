@@ -1,10 +1,7 @@
 import os
 import sys
-
-
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 import argparse  # 命令行参数解析
 import time  # 时间统计
 import warnings  # 警告控制
@@ -53,17 +50,18 @@ def train_epoch(epoch,loader,iters,start_step=0,wandb=None):
            loss=(loss*loss_mask).sum()/loss_mask.sum()
 
            loss=loss/args.accumulation_steps
-    #反向传播
-    scaler.scale(loss).backward()  # 计算梯度
-    #梯度下降，优化参数
-    if step % args.accumulation_steps == 0:
-        scaler.unscale_(optimizer)
-        #梯度裁剪
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        #梯度为0，梯度设置为None 节省内存
-        optimizer.zero_grad(set_to_none=True)
+        #反向传播
+        scaler.scale(loss).backward()  # 计算梯度
+        #梯度下降，优化参数
+        if step % args.accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            #梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            #梯度为0，梯度设置为None 节省内存
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
 
     if step % args.log_interval == 0 or step == iters - 1:
         spend_time = time.time() - start_time
